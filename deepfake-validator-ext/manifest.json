@@ -10,14 +10,20 @@
   "host_permissions": [
     "<all_urls>"
   ],
-  "background": {
-    "service_worker": "background.js"
+  "sandbox": {
+    "pages": ["sandbox.html"]
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["sandbox.html", "lib/tf.min.js", "sandbox.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
       "css": ["styles.css"],
-      "js": ["lib/tf.min.js", "content.js"] 
+      "js": ["content.js"]
     }
   ],
   "action": {
