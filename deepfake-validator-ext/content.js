@@ -12,6 +12,25 @@ canvas.width = 224;
 canvas.height = 224;
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
+// --- NEW: INITIALIZE TENSORFLOW WITH STRICT CSP SAFETY ---
+async function initTensorFlow() {
+    try {
+        // Force TF.js to not use evaluated code generation features
+        tf.env().set('ENGINE_COMPILE_ONLY', true);
+        
+        // Try setting to webgl first (GPU-accelerated, usually safe in content scripts)
+        // If it still errors out on specific sites, we default down to CPU mode.
+        await tf.setBackend('webgl');
+        console.log("Deepfake Validator: TF.js initialized using WebGL backend.");
+    } catch (e) {
+        console.warn("WebGL fallback triggered. Using CPU backend due to policy restrictions:", e);
+        await tf.setBackend('cpu');
+        console.log("Deepfake Validator: TF.js initialized using CPU backend.");
+    }
+}
+// Run initialization as soon as the script injects
+initTensorFlow();
+
 // 1. Observe the DOM for video elements
 const observer = new MutationObserver(() => {
     const video = document.querySelector('video');
@@ -57,9 +76,6 @@ function stopCapture() {
 // 3. The Local TensorFlow.js Engine
 async function analyzeSequenceLocally(frames) {
     try {
-        // Here is where your future TF.js logic will convert 'frames' to Tensors
-        // and run model.predict(). We have full WebGL access here!
-        
         // --- SIMULATION (While we wait for your Python model) ---
         const score = Math.random(); 
 
