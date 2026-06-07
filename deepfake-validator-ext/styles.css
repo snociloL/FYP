@@ -1,0 +1,20 @@
+/* styles.css */
+
+#df-validator-overlay {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    z-index: 9999;
+    padding: 10px 15px;
+    border-radius: 8px;
+    font-family: Arial, sans-serif;
+    font-weight: bold;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    pointer-events: none; /* Let clicks pass through to the video */
+    transition: background-color 0.3s ease;
+}
+
+.df-state-green { background-color: #28a745; border: 2px solid #1e7e34; }
+.df-state-red { background-color: #dc3545; border: 2px solid #bd2130; }
+.df-state-gray { background-color: #ffc107; color: #333; border: 2px solid #d39e00; }
