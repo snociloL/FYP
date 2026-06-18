@@ -1,0 +1,14 @@
+/* indicator.css */
+#deepfake-status {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    padding: 10px 20px;
+    border-radius: 20px;
+    color: white;
+    font-weight: bold;
+    z-index: 9999;
+}
+.gray { background-color: #808080; } /* Analyzing */
+.red  { background-color: #ff4444; } /* Fake Detected */
+.green { background-color: #00cc00; } /* Real Detected */

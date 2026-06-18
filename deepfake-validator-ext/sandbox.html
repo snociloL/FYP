@@ -1,10 +1,196 @@
 <!DOCTYPE html>
 <html>
-<head>
-    <meta charset="utf-8">
-    <script src="lib/tf.min.js"></script>
-    <script src="sandbox.js"></script>
-</head>
+<head><meta charset="utf-8"></head>
 <body>
+<script src="lib/tf.min.js"></script>
+<script>
+window.parent.postMessage({ action: 'SANDBOX_READY' }, '*');
+
+// Surface anything that escapes a try/catch (async TF.js errors, etc.)
+window.addEventListener('error', (e) => {
+    window.parent.postMessage({ action: 'SANDBOX_ERROR', text: 'window.onerror: ' + (e.message || e.error || 'unknown') }, '*');
+});
+window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    window.parent.postMessage({ action: 'SANDBOX_ERROR', text: 'unhandledrejection: ' + ((r && (r.stack || r.message)) || r || 'unknown') }, '*');
+});
+
+let model;
+
+// State for receiving shards one-at-a-time from offscreen (flow-controlled)
+let pendingModelJson  = null;
+let pendingMerged     = null;   // single pre-allocated Uint8Array for all weights
+let pendingOffset     = 0;
+let pendingTotal      = 0;
+let pendingReceived   = 0;
+
+// Keras 3.x → TF.js format patcher
+function patchKeras3Format(modelJson) {
+    const topology = modelJson.modelTopology;
+    if (!topology) return;
+    const modelConfig = topology.model_config || topology;
+    if (modelConfig && modelConfig.config && modelConfig.config.layers) {
+        patchLayerList(modelConfig.config.layers);
+    }
+}
+function patchLayerList(layers) {
+    if (!Array.isArray(layers)) return;
+    for (const layer of layers) patchLayer(layer);
+}
+function patchLayer(layer) {
+    if (!layer) return;
+    if (layer.class_name === 'InputLayer' && layer.config) {
+        const cfg = layer.config;
+        if (cfg.batch_shape && !cfg.batch_input_shape) { cfg.batch_input_shape = cfg.batch_shape; delete cfg.batch_shape; }
+        if (cfg.shape && !cfg.batch_input_shape && !cfg.input_shape) { cfg.batch_input_shape = [null].concat(cfg.shape); delete cfg.shape; }
+    }
+    if (layer.config && layer.config.dtype && typeof layer.config.dtype === 'object') {
+        const d = layer.config.dtype;
+        layer.config.dtype = (d.config && (d.config.name || d.config.dtype)) || 'float32';
+    }
+    if (Array.isArray(layer.inbound_nodes) && layer.inbound_nodes.length) {
+        layer.inbound_nodes = layer.inbound_nodes.map(fixNode);
+    }
+    if (layer.config && Array.isArray(layer.config.layers)) patchLayerList(layer.config.layers);
+    if (layer.config && layer.config.layer) patchLayer(layer.config.layer);
+}
+function fixNode(node) {
+    if (!node || Array.isArray(node)) return node;
+    if (typeof node !== 'object') return node;
+    const args = node.args;
+    if (!args || !Array.isArray(args) || !args.length) return [];
+    const connections = args.map(extractTensorConn).filter(c => c !== null);
+    if (connections.length === 0) return [];
+    if (connections.length === 1) return connections[0];
+    return connections;
+}
+function extractTensorConn(obj) {
+    if (!obj) return null;
+    if (Array.isArray(obj)) {
+        const conns = obj.map(extractTensorConn).filter(c => c !== null);
+        if (conns.length === 0) return null;
+        if (conns.length === 1) return conns[0];
+        return conns;
+    }
+    if (obj.keras_history) { const [n,ni,ti] = obj.keras_history; return [n,ni,ti,{}]; }
+    if (obj.config && obj.config.keras_history) { const [n,ni,ti] = obj.config.keras_history; return [n,ni,ti,{}]; }
+    return null;
+}
+
+function log(text) { console.log('[sandbox]', text); window.parent.postMessage({ action: 'SANDBOX_LOG', text }, '*'); }
+function err(text) { console.error('[sandbox]', text); window.parent.postMessage({ action: 'SANDBOX_ERROR', text }, '*'); }
+
+async function loadModel(modelJson, weightData) {
+    try {
+        log('Patching Keras 3 → TF.js format...');
+        patchKeras3Format(modelJson);
+
+        const _mc = modelJson.modelTopology.model_config || modelJson.modelTopology;
+        const _cfg = (_mc && _mc.config) || {};
+        const _td = (_cfg.layers || []).find(l => l.class_name === 'TimeDistributed');
+        if (_td) {
+            log('TD nodes: ' + JSON.stringify(_td.inbound_nodes));
+            const _inner = _td.config && _td.config.layer;
+            if (_inner && _inner.config && _inner.config.layers) {
+                const _conv = _inner.config.layers.find(l => l.class_name === 'Conv2D');
+                if (_conv) log('Conv2D nodes: ' + JSON.stringify(_conv.inbound_nodes));
+            }
+        }
+
+        // Force CPU backend: WebGL stalls hard packing 325 weight tensors into
+        // textures for a model this size. CPU keeps them as plain arrays.
+        log('Setting CPU backend...');
+        await tf.setBackend('cpu');
+        await tf.ready();
+        log('TF backend: ' + tf.getBackend());
+
+        log('Loading layers model (' + (weightData.byteLength / 1e6).toFixed(1) + ' MB weights)...');
+        // Heartbeat so we can distinguish "slow" from "hung"
+        let secs = 0;
+        const hb = setInterval(() => { secs += 3; log('...still loading (' + secs + 's)'); }, 3000);
+        try {
+            model = await tf.loadLayersModel(tf.io.fromMemory({
+                modelTopology: modelJson.modelTopology,
+                weightSpecs:   modelJson.weightsManifest[0].weights,
+                weightData:    weightData,
+            }));
+        } finally {
+            clearInterval(hb);
+        }
+
+        log('Model loaded!');
+        window.parent.postMessage({ action: 'MODEL_READY' }, '*');
+    } catch (e) {
+        err((e && (e.stack || e.message || e.name || String(e))) || 'unknown error');
+    }
+}
+
+window.addEventListener('message', async (event) => {
+    if (!event.data) return;
+    const { action } = event.data;
+
+    // Phase 1: receive model header + shard count, then request shard 0
+    if (action === 'INIT_MODEL_START') {
+        pendingModelJson = event.data.modelJson;
+        pendingTotal     = event.data.totalShards;
+        pendingMerged    = new Uint8Array(event.data.totalBytes);
+        pendingOffset    = 0;
+        pendingReceived  = 0;
+        log('Header received — expecting ' + pendingTotal + ' shards (' + (event.data.totalBytes / 1e6).toFixed(1) + ' MB)');
+        window.parent.postMessage({ action: 'SHARD_ACK', next: 0 }, '*');
+        return;
+    }
+
+    // Phase 2: copy each shard into the merged buffer, then ACK the next one
+    if (action === 'WEIGHT_SHARD') {
+        const { index, data } = event.data;
+        if (!pendingMerged) { err('Got shard before INIT_MODEL_START'); return; }
+        try {
+            pendingMerged.set(new Uint8Array(data), pendingOffset);
+            pendingOffset += data.byteLength;
+            pendingReceived++;
+        } catch (e) {
+            err('Merge failed at shard ' + index + ' (offset ' + pendingOffset + '): ' + (e.message || e));
+            return;
+        }
+        log('Shards: ' + pendingReceived + '/' + pendingTotal);   // log EVERY shard for now
+
+        if (pendingReceived < pendingTotal) {
+            // Request the next shard (one in flight at a time = no IPC pipe overflow)
+            window.parent.postMessage({ action: 'SHARD_ACK', next: index + 1 }, '*');
+        } else {
+            log('All shards received — loading...');
+            const mj = pendingModelJson;
+            const buf = pendingMerged.buffer;
+            pendingModelJson = pendingMerged = null;
+            pendingTotal = pendingReceived = pendingOffset = 0;
+            loadModel(mj, buf);
+        }
+        return;
+    }
+
+    if (action === 'PROCESS_FRAME') {
+        if (!model) return;
+        let tensors = [], sequence = null, prediction = null;
+        try {
+            tensors = event.data.frames.map(pixels =>
+                tf.tensor3d(pixels, [224, 224, 4]).slice([0,0,0],[-1,-1,3]).div(255.0)
+            );
+            sequence = tf.stack(tensors).expandDims(0);
+            prediction = model.predict(sequence);
+            const score = prediction.dataSync()[0];
+            log('Score: ' + score.toFixed(4));
+            const state = score > 0.85 ? 'red' : score < 0.15 ? 'green' : 'gray';
+            window.parent.postMessage({ action: 'RESULT', state, confidence: Math.round(score * 100) }, '*');
+        } catch (e) {
+            err('Inference: ' + e.message);
+        } finally {
+            tensors.forEach(t => t.dispose());
+            if (sequence) sequence.dispose();
+            if (prediction) prediction.dispose();
+        }
+    }
+});
+</script>
 </body>
 </html>

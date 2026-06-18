@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TF.js Model Load Test (standalone)</title>
+  <style>
+    body { font-family: monospace; background:#111; color:#0f0; padding:20px; }
+    pre  { white-space: pre-wrap; }
+    .err { color:#f55; }
+    .ok  { color:#5f5; }
+  </style>
+</head>
+<body>
+  <h2>Standalone TF.js model-load test</h2>
+  <p>Tests whether <code>lib/web_model</code> loads in plain TF.js — no extension, no sandbox, no CSP.</p>
+  <pre id="out"></pre>
+
+  <script src="lib/tf.min.js"></script>
+  <script>
+  const out = document.getElementById('out');
+  function log(t, cls) {
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = t;
+    out.appendChild(line);
+    console.log('[test]', t);
+  }
+
+  // ── same Keras 3 → TF.js patcher as the extension ──
+  function patchKeras3Format(modelJson){const t=modelJson.modelTopology;if(!t)return;const mc=t.model_config||t;if(mc&&mc.config&&mc.config.layers)patchLayerList(mc.config.layers);}
+  function patchLayerList(ls){if(Array.isArray(ls))for(const l of ls)patchLayer(l);}
+  function patchLayer(layer){
+    if(!layer)return;
+    if(layer.class_name==='InputLayer'&&layer.config){const c=layer.config;if(c.batch_shape&&!c.batch_input_shape){c.batch_input_shape=c.batch_shape;delete c.batch_shape;}if(c.shape&&!c.batch_input_shape&&!c.input_shape){c.batch_input_shape=[null].concat(c.shape);delete c.shape;}}
+    if(layer.config&&layer.config.dtype&&typeof layer.config.dtype==='object'){const d=layer.config.dtype;layer.config.dtype=(d.config&&(d.config.name||d.config.dtype))||'float32';}
+    if(Array.isArray(layer.inbound_nodes)&&layer.inbound_nodes.length)layer.inbound_nodes=layer.inbound_nodes.map(fixNode);
+    if(layer.config&&Array.isArray(layer.config.layers))patchLayerList(layer.config.layers);
+    if(layer.config&&layer.config.layer)patchLayer(layer.config.layer);
+  }
+  function fixNode(n){if(!n||Array.isArray(n))return n;if(typeof n!=='object')return n;const a=n.args;if(!a||!Array.isArray(a)||!a.length)return [];const c=a.map(extractTensorConn).filter(x=>x!==null);if(!c.length)return [];return c.length===1?c[0]:c;}
+  function extractTensorConn(o){if(!o)return null;if(Array.isArray(o)){const c=o.map(extractTensorConn).filter(x=>x!==null);if(!c.length)return null;return c.length===1?c[0]:c;}if(o.keras_history){const[n,i,t]=o.keras_history;return[n,i,t,{}];}if(o.config&&o.config.keras_history){const[n,i,t]=o.config.keras_history;return[n,i,t,{}];}return null;}
+
+  (async () => {
+    try {
+      log('TF.js version: ' + tf.version.tfjs);
+      log('Fetching model.json…');
+      const modelJson = await fetch('lib/web_model/model.json').then(r => r.json());
+
+      const paths = modelJson.weightsManifest.flatMap(g => g.paths);
+      log('Fetching ' + paths.length + ' weight file(s)…');
+      const bufs = [];
+      for (const p of paths) bufs.push(await fetch('lib/web_model/' + p).then(r => r.arrayBuffer()));
+      const total = bufs.reduce((s,b)=>s+b.byteLength,0);
+      const merged = new Uint8Array(total); let off=0;
+      for (const b of bufs){ merged.set(new Uint8Array(b),off); off+=b.byteLength; }
+      log('Weights: ' + (total/1e6).toFixed(1) + ' MB');
+
+      log('Patching topology…');
+      patchKeras3Format(modelJson);
+
+      await tf.setBackend('cpu');     // match the extension path; change to 'webgl' to compare
+      await tf.ready();
+      log('Backend: ' + tf.getBackend());
+
+      let secs=0; const hb=setInterval(()=>{secs+=2;log('…still loading ('+secs+'s) — if this counts past ~20s the topology is the problem','err');},2000);
+      log('Calling tf.loadLayersModel…');
+      let model;
+      try {
+        model = await tf.loadLayersModel(tf.io.fromMemory({
+          modelTopology: modelJson.modelTopology,
+          weightSpecs:   modelJson.weightsManifest[0].weights,
+          weightData:    merged.buffer,
+        }));
+      } finally { clearInterval(hb); }
+
+      log('✅ MODEL LOADED', 'ok');
+      log('Inputs: ' + JSON.stringify(model.inputs.map(i=>i.shape)));
+      log('Outputs: ' + JSON.stringify(model.outputs.map(o=>o.shape)));
+
+      log('Running a dummy prediction (random 1×30×224×224×3)…');
+      const x = tf.randomNormal([1,30,224,224,3]);
+      const y = model.predict(x);
+      const score = (await y.data())[0];
+      log('✅ PREDICTION OK — score = ' + score.toFixed(5), 'ok');
+      x.dispose(); y.dispose();
+      log('The model loads and runs in TF.js. The blocker is extension-specific.', 'ok');
+    } catch (e) {
+      log('❌ ERROR: ' + (e.stack || e.message || e), 'err');
+    }
+  })();
+  </script>
+</body>
+</html>

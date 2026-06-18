@@ -1,0 +1,26 @@
+# Trained models & weights (reproducible via train_deepfake.py — too large for GitHub)
+*.h5
+*.weights.h5
+*.keras
+
+# Feature cache & dataset manifests (reproducible via prepare_dataset.py / train_deepfake.py)
+features.npz
+*.npz
+sequences_manifest.json
+
+# TF.js converted model artifacts (legacy in-browser path, now served by backend.py)
+deepfake-validator-ext/lib/web_model/
+deepfake-validator-ext/lib/web_model_fp32/
+deepfake-validator-ext/lib/*.wasm
+deepfake-validator-ext/lib/tf-*.min.js
+web_model_layers/
+
+# Raw tensors / datasets
+deepfake-ai-backend/data/tensors.zip
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
