@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Deepfake Video Validator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 520px;
+    }
+    .header { margin-bottom: 20px; }
+    .header h1 { font-size: 22px; color: #fff; }
+    .header p  { font-size: 13px; color: #888; margin-top: 4px; }
+
+    .status {
+      background: #0f3460;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: #a0c4ff;
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+    }
+
+    .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #666;
+      margin-bottom: 8px;
+    }
+
+    .upload-label {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 24px;
+      border: 2px dashed #0f3460;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      color: #888;
+      transition: all 0.15s;
+    }
+    .upload-label:hover { border-color: #a0c4ff; color: #a0c4ff; }
+    .upload-label.disabled { opacity: 0.4; cursor: not-allowed; }
+    #videoInput { display: none; }
+
+    .yt-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      margin-top: 10px;
+      padding: 14px;
+      background: #1a1a1a;
+      border: 2px solid #333;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      color: #888;
+      transition: all 0.15s;
+    }
+    .yt-btn:hover:not(:disabled) { border-color: #ff4444; color: #ff6b6b; }
+    .yt-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .divider {
+      text-align: center;
+      font-size: 11px;
+      color: #444;
+      margin: 14px 0 4px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .progress {
+      font-size: 12px;
+      color: #888;
+      margin-top: 12px;
+      text-align: center;
+      min-height: 16px;
+    }
+
+    .result {
+      margin-top: 16px;
+      padding: 20px;
+      border-radius: 8px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: 700;
+      display: none;
+    }
+    .result.fake      { background: #3d0000; color: #ff6b6b; display: block; }
+    .result.real      { background: #003d00; color: #6bff6b; display: block; }
+    .result.uncertain { background: #2a2a00; color: #ffd76b; display: block; }
+    .result .conf     { font-size: 13px; font-weight: 400; margin-top: 6px; opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <h1>Deepfake Video Validator</h1>
+      <p>ResNet-50 + LSTM &middot; powered by local Python backend</p>
+    </div>
+
+    <div class="status" id="statusEl">Initializing model…</div>
+
+    <div class="label">Upload a video to analyze</div>
+    <label class="upload-label disabled" id="uploadLabel" for="videoInput">
+      &#128190; Choose video (.mp4 / .webm / .mov)
+    </label>
+    <input type="file" id="videoInput" accept="video/*" disabled>
+
+    <div class="divider">or</div>
+    <button class="yt-btn" id="ytBtn" disabled>
+      &#9654; Analyze playing YouTube tab
+    </button>
+
+    <div class="progress" id="progressEl"></div>
+    <div class="result"   id="resultEl">
+      <div id="resultText"></div>
+      <div class="conf" id="confText"></div>
+    </div>
+  </div>
+
+  <script src="analyzer.js"></script>
+</body>
+</html>

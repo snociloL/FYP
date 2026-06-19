@@ -1,32 +1,35 @@
 {
   "manifest_version": 3,
   "name": "Deepfake Video Validator",
-  "version": "1.0",
-  "description": "Validates web videos for AI manipulation using ResNet-50 and LSTM.",
+  "version": "3.0",
+  "description": "Validates videos for AI manipulation using ResNet-50 + LSTM via local Python backend.",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "tabs",
+    "tabCapture",
+    "offscreen"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "http://127.0.0.1:5000/*"
   ],
-  "sandbox": {
-    "pages": ["sandbox.html"]
+  "background": {
+    "service_worker": "background.js"
   },
   "web_accessible_resources": [
     {
-      "resources": ["sandbox.html", "lib/tf.min.js", "sandbox.js"],
+      "resources": ["offscreen.html", "offscreen.js"],
       "matches": ["<all_urls>"]
     }
   ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "css": ["styles.css"],
+      "css": ["indicator.css"],
       "js": ["content.js"]
     }
   ],
   "action": {
-    "default_title": "Deepfake Validator Status"
+    "default_title": "Deepfake Validator — click to open analyzer"
   }
 }
