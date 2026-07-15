@@ -9,18 +9,13 @@
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       background: #1a1a2e;
       color: #e0e0e0;
-      min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      padding: 40px 20px;
+      width: 340px;
+      padding: 16px;
     }
-    .card {
-      width: 100%;
-      max-width: 520px;
-    }
-    .header { margin-bottom: 20px; }
-    .header h1 { font-size: 22px; color: #fff; }
-    .header p  { font-size: 13px; color: #888; margin-top: 4px; }
+    .card { width: 100%; }
+    .header { margin-bottom: 14px; }
+    .header h1 { font-size: 17px; color: #fff; }
+    .header p  { font-size: 11px; color: #888; margin-top: 3px; }
 
     .status {
       background: #0f3460;
@@ -114,7 +109,7 @@
   <div class="card">
     <div class="header">
       <h1>Deepfake Video Validator</h1>
-      <p>ResNet-50 + LSTM &middot; powered by local Python backend</p>
+      <p>ResNet-50 + LSTM &middot; powered by Hugging Face backend</p>
     </div>
 
     <div class="status" id="statusEl">Initializing model…</div>
@@ -127,7 +122,7 @@
 
     <div class="divider">or</div>
     <button class="yt-btn" id="ytBtn" disabled>
-      &#9654; Analyze playing YouTube tab
+      &#9654; Analyze current video tab
     </button>
 
     <div class="progress" id="progressEl"></div>
