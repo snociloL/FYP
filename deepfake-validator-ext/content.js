@@ -1,28 +1,35 @@
-const statusDiv = document.createElement('div');
-statusDiv.id = 'deepfake-status';
-statusDiv.innerText = 'Deepfake Validator: Click the extension icon to start.';
-statusDiv.style.cssText = `
-    position: fixed; top: 10px; right: 10px; z-index: 2147483647;
-    background: rgba(0,0,0,0.85); color: white; padding: 10px 14px;
-    font-weight: bold; border-radius: 6px; font-size: 13px;
-    font-family: sans-serif; max-width: 280px; line-height: 1.4;
-`;
-document.body.appendChild(statusDiv);
+const pill = document.createElement('div');
+pill.id = 'deepfake-status';
+const dot = document.createElement('span');
+dot.className = 'df-dot';
+const txt = document.createElement('span');
+txt.className = 'df-text';
+pill.append(dot, txt);
+document.body.appendChild(pill);
 
+let hideTimer;
+
+function show(text, state /* '', 'busy', 'red', 'green', 'amber' */) {
+    pill.classList.remove('df-busy', 'df-red', 'df-green', 'df-amber');
+    if (state) pill.classList.add('df-' + state);
+    txt.textContent = text;
+    // force-reflow so the transition replays even on rapid updates
+    void pill.offsetWidth;
+    pill.classList.add('df-show');
+}
+
+function autoHide(ms) {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => pill.classList.remove('df-show'), ms);
+}
+
+// The pill stays hidden until an analysis is running — passive and non-intrusive.
 chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action === 'STATUS') {
-        statusDiv.style.background = 'rgba(0,0,0,0.85)';
-        statusDiv.innerText = msg.text;
+        show(msg.text, 'busy');
+        clearTimeout(hideTimer);            // keep visible while analyzing
     } else if (msg.action === 'RESULT') {
-        if (msg.state === 'red') {
-            statusDiv.style.background = 'rgba(180,0,0,0.9)';
-            statusDiv.innerText = `DEEPFAKE DETECTED (${msg.confidence}% confidence)`;
-        } else if (msg.state === 'green') {
-            statusDiv.style.background = 'rgba(0,140,0,0.9)';
-            statusDiv.innerText = `REAL VIDEO (${100 - msg.confidence}% confidence)`;
-        } else {
-            statusDiv.style.background = 'rgba(100,100,0,0.9)';
-            statusDiv.innerText = `UNCERTAIN (score: ${msg.confidence}%)`;
-        }
+        show(msg.text || 'Result', msg.state || 'amber');
+        autoHide(6000);
     }
 });

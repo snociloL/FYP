@@ -8,13 +8,13 @@ We group by (videoID, faceIndex) = one face track through time = one sequence.
 import os, re, json, random
 from collections import defaultdict
 
-TRAIN_DIR = r"D:\train"
+TRAIN_DIR = r"D:\train_ff"   # Model C: FaceForensics++ ONLY (original reals + 4 manip fakes)
 OUT = r"D:\Codes\Code files\FYP\sequences_manifest.json"
 SEQ_LEN = 30
 VAL_FRAC = 0.2
 random.seed(42)
 
-pat = re.compile(r"^(.*)_(\d+)_(\d+)\.png$", re.IGNORECASE)
+pat = re.compile(r"^(.*)_(\d+)_(\d+)\.(?:png|jpe?g)$", re.IGNORECASE)
 
 def scan(folder, label):
     # groups[(video, face)] = list of (frame_no, path)
@@ -41,25 +41,39 @@ print("Scanning real/ …")
 real = scan("real", 0)
 print(f"Usable sequences (>= {SEQ_LEN} frames):  fake={len(fake)}  real={len(real)}")
 
-# Split by VIDEO so frames/faces from one video never straddle train & val
-def split_by_video(seqs):
-    by_vid = defaultdict(list)
-    for s in seqs:
-        by_vid[s["video"]].append(s)
-    vids = list(by_vid)
-    random.shuffle(vids)
-    n_val = max(1, int(len(vids) * VAL_FRAC))
-    val_vids = set(vids[:n_val])
-    train, val = [], []
-    for v, ss in by_vid.items():
-        (val if v in val_vids else train).extend(ss)
-    return train, val
+# Identity-aware split: a FF++ real video (ffreal_NNN) and the fakes made from
+# it (ffdf_NNN_*) share identity NNN, so they must land on the SAME side or the
+# model could memorise the person/scene. We therefore split by IDENTITY across
+# BOTH classes jointly. DFDC video IDs never share an identity across classes,
+# so they fall back to a per-video split.
+FF_PREFIXES = ("ffreal_", "ffdf_", "fff2f_", "ffshift_", "ffswap_")  # real + 4 manip methods
+def identity_of(vid):
+    if vid.startswith(FF_PREFIXES):
+        return "ff_" + vid.split("_")[1]      # FF++ target id (e.g. ff_000) — shared by
+        # the original video and every manipulation made from it
+    return vid                                # (DFDC fallback; unused in FF++-only Model C)
 
-f_tr, f_va = split_by_video(fake)
-r_tr, r_va = split_by_video(real)
-train = f_tr + r_tr
-val   = f_va + r_va
+all_seqs = fake + real
+for s in all_seqs:
+    s["identity"] = identity_of(s["video"])
+
+by_id = defaultdict(list)
+for s in all_seqs:
+    by_id[s["identity"]].append(s)
+ids = list(by_id)
+random.shuffle(ids)
+val_ids = set(ids[:max(1, int(len(ids) * VAL_FRAC))])
+
+train, val = [], []
+for i, ss in by_id.items():
+    (val if i in val_ids else train).extend(ss)
+
+f_tr = [s for s in train if s["label"] == 1]
+r_tr = [s for s in train if s["label"] == 0]
+f_va = [s for s in val   if s["label"] == 1]
+r_va = [s for s in val   if s["label"] == 0]
 random.shuffle(train); random.shuffle(val)
+print(f"Identities: {len(ids)} total, {len(val_ids)} held out for validation")
 
 manifest = {
     "seq_len": SEQ_LEN,

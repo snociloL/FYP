@@ -11,7 +11,7 @@
     "offscreen"
   ],
   "host_permissions": [
-    "http://127.0.0.1:5000/*"
+    "https://snocilol-deepfake-validator.hf.space/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -30,6 +30,7 @@
     }
   ],
   "action": {
-    "default_title": "Deepfake Validator — click to open analyzer"
+    "default_title": "Deepfake Validator",
+    "default_popup": "analyzer.html"
   }
 }

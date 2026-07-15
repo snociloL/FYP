@@ -1,189 +1,194 @@
 """
-Train ResNet50 + LSTM deepfake detector on the face-crop sequences.
+Train ResNet50 + LSTM deepfake detector — v2 (balanced + augmented + fine-tune).
 
-Strategy (fast on CPU): ResNet50 is FROZEN, so its 2048-d features are static.
-We extract them ONCE (cached to features.npz), then train only the LSTM head
-on cached features. Finally we rebuild the full ResNet50+LSTM model and save it
-so the extension/backend can feed raw 30-frame clips.
+Upgrades over the cached-feature version, all aimed at fixing the model's bias
+toward "fake" and its low confidence on real videos:
 
-PREPROCESSING: ResNet50 features use keras resnet50.preprocess_input. The saved
-full model therefore expects inputs already passed through preprocess_input.
-Inference (test_model.py / backend) MUST apply the same preprocess_input.
+  1. BALANCED SAMPLING — each epoch draws an equal number of real and fake
+     sequences (the minority real class is oversampled with fresh random
+     windows + augmentation), so the model stops defaulting to "fake".
+  2. IMAGE AUGMENTATION — per-sequence flip / brightness / contrast / JPEG
+     re-compression. JPEG artifacts matter: deepfakes carry tell-tale
+     compression traces, so this teaches robustness instead of memorising.
+  3. OPTIONAL FINE-TUNING — after the LSTM head learns, unfreeze ResNet's top
+     block (conv5) at a low LR so the CNN adapts to face-manipulation cues.
 
-Run:
-    python prepare_dataset.py        # once, builds sequences_manifest.json
+Because of (2) and (3) the frozen-feature cache can't be used — frames go
+through ResNet end-to-end every epoch. THIS NEEDS A GPU (use Colab T4).
+
+    python prepare_dataset.py     # once, builds sequences_manifest.json
     python train_deepfake.py
 """
-import os, json, hashlib
+import os, json, random
 import numpy as np
-
-MANIFEST = r"D:\Codes\Code files\FYP\sequences_manifest.json"
-FEAT_CACHE = r"D:\Codes\Code files\FYP\features.npz"
-OUT_MODEL = r"D:\Codes\Code files\FYP\deepfake_resnet_lstm_v2.h5"
-SEQ_LEN = 30
-SIZE = 224
-SAMPLES_PER_SEQ = 3      # random 30-frame windows per train sequence each epoch
-EPOCHS = 40
-BATCH = 8
-
+import cv2
 import keras
 from keras import layers
 from keras.applications.resnet50 import ResNet50, preprocess_input
-import cv2
+
+# ── Config ──────────────────────────────────────────────────────────────────
+MANIFEST   = r"D:\Codes\Code files\FYP\sequences_manifest.json"
+OUT_MODEL  = r"D:\Codes\Code files\FYP\deepfake_resnet_lstm_v2.h5"
+SEQ_LEN, SIZE = 30, 224
+BATCH = 4                       # 4 seqs × 30 frames = 120 imgs/step (fits a T4)
+EPOCHS_HEAD     = 25            # phase 1: frozen ResNet, train LSTM head
+FINE_TUNE       = True          # phase 2: unfreeze conv5 and fine-tune
+EPOCHS_FINETUNE = 12
+random.seed(42); np.random.seed(42)
 
 man = json.load(open(MANIFEST))
-train_seqs, val_seqs = man["train"], man["val"]
-print("Sequences:", man["counts"])
+train = man["train"]; val = man["val"]
+train_fake = [s for s in train if s["label"] == 1]
+train_real = [s for s in train if s["label"] == 0]
+print(f"Train: {len(train_fake)} fake / {len(train_real)} real   Val: {len(val)}")
 
-# ---- 1. Collect every unique frame path referenced by the manifest ----
-all_paths = set()
-for s in train_seqs + val_seqs:
-    all_paths.update(s["frames"])
-all_paths = sorted(all_paths)
-path_to_idx = {p: i for i, p in enumerate(all_paths)}
-print(f"Unique frames to featurize: {len(all_paths)}")
 
-# ---- 2. Extract (or load cached) ResNet50 features ----
-def load_img(p):
-    img = cv2.imread(p)                       # BGR
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (SIZE, SIZE))
-    return img.astype(np.float32)
-
-if os.path.exists(FEAT_CACHE):
-    print("Loading cached features…")
-    z = np.load(FEAT_CACHE, allow_pickle=True)
-    feats = z["feats"]
-    cached_paths = list(z["paths"])
-    if cached_paths != all_paths:
-        print("Cache mismatch — re-extracting.")
-        os.remove(FEAT_CACHE)
-
-if not os.path.exists(FEAT_CACHE):
-    print("Extracting ResNet50 features (one-time; slow on CPU, fast on GPU)…")
-    base = ResNet50(include_top=False, weights="imagenet",
-                    pooling="avg", input_shape=(SIZE, SIZE, 3))
-    base.trainable = False
-    feats = np.zeros((len(all_paths), 2048), np.float32)
-    B = 64
-    for i in range(0, len(all_paths), B):
-        batch_paths = all_paths[i:i + B]
-        x = np.stack([load_img(p) for p in batch_paths])
-        x = preprocess_input(x)
-        feats[i:i + B] = base.predict(x, verbose=0)
-        if (i // B) % 20 == 0:
-            print(f"  {i}/{len(all_paths)}")
-    np.savez(FEAT_CACHE, feats=feats, paths=np.array(all_paths))
-    print(f"Saved feature cache -> {FEAT_CACHE}")
-
-# ---- 3. Data generator over cached features ----
+# ── Data generator: balanced, with per-sequence augmentation ────────────────
 class SeqGen(keras.utils.PyDataset):
-    def __init__(self, seqs, training, **kwargs):
+    def __init__(self, training, fake=None, real=None, items=None, **kwargs):
         super().__init__(**kwargs)
         self.training = training
-        # expand: list each seq SAMPLES_PER_SEQ times when training (random windows)
-        self.items = []
-        reps = SAMPLES_PER_SEQ if training else 1
-        for s in seqs:
-            for _ in range(reps):
-                self.items.append(s)
+        self.fake, self.real, self.items = fake, real, items
         self.on_epoch_end()
 
-    def __len__(self):
-        return int(np.ceil(len(self.items) / BATCH))
-
     def on_epoch_end(self):
-        self.order = np.random.permutation(len(self.items)) if self.training \
-                     else np.arange(len(self.items))
+        if self.training:
+            n = max(len(self.fake), len(self.real))     # oversample minority
+            items = [(random.choice(self.fake), 1) for _ in range(n)] + \
+                    [(random.choice(self.real), 0) for _ in range(n)]
+            random.shuffle(items)
+            self._items = items
+        else:
+            self._items = self.items
+
+    def __len__(self):
+        return int(np.ceil(len(self._items) / BATCH))
 
     def _window(self, frames):
         n = len(frames)
-        if self.training:
-            # random contiguous-ish window: evenly spaced start jitter
-            if n > SEQ_LEN:
-                start = np.random.randint(0, n - SEQ_LEN + 1)
-                idx = np.linspace(start, min(n - 1, start + SEQ_LEN * 2), SEQ_LEN)
-                idx = np.clip(idx.astype(int), 0, n - 1)
-            else:
-                idx = np.clip(np.arange(SEQ_LEN), 0, n - 1)
+        if self.training and n > SEQ_LEN:
+            start = random.randint(0, n - SEQ_LEN)
+            idx = np.clip(np.linspace(start, min(n - 1, start + SEQ_LEN * 2),
+                                      SEQ_LEN).astype(int), 0, n - 1)
         else:
             idx = np.linspace(0, n - 1, SEQ_LEN).astype(int)
         return [frames[i] for i in idx]
 
+    def _aug_params(self):
+        return dict(flip=random.random() < 0.5,
+                    bright=random.uniform(0.85, 1.15),
+                    contrast=random.uniform(0.85, 1.15),
+                    jpeg_q=random.choice([None, 90, 70, 55, 40]))
+
+    def _load(self, path, p):
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (SIZE, SIZE))
+        if p:                                            # same aug across the seq
+            if p["flip"]:
+                img = img[:, ::-1]
+            img = np.clip((img.astype(np.float32) - 128) * p["contrast"] + 128, 0, 255)
+            img = np.clip(img * p["bright"], 0, 255).astype(np.uint8)
+            if p["jpeg_q"]:
+                enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+                                   [cv2.IMWRITE_JPEG_QUALITY, p["jpeg_q"]])[1]
+                img = cv2.cvtColor(cv2.imdecode(enc, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        return img.astype(np.float32)
+
     def __getitem__(self, b):
-        ids = self.order[b * BATCH:(b + 1) * BATCH]
-        X = np.zeros((len(ids), SEQ_LEN, 2048), np.float32)
-        y = np.zeros((len(ids), 1), np.float32)
-        for j, k in enumerate(ids):
-            s = self.items[k]
-            win = self._window(s["frames"])
-            X[j] = feats[[path_to_idx[p] for p in win]]
-            y[j] = s["label"]
+        batch = self._items[b * BATCH:(b + 1) * BATCH]
+        X = np.zeros((len(batch), SEQ_LEN, SIZE, SIZE, 3), np.float32)
+        y = np.zeros((len(batch), 1), np.float32)
+        for j, (seq, label) in enumerate(batch):
+            p = self._aug_params() if self.training else None
+            frames = self._window(seq["frames"])
+            X[j] = preprocess_input(np.stack([self._load(f, p) for f in frames]))
+            y[j] = label
         return X, y
 
-# ---- 4. LSTM head model ----
-head = keras.Sequential([
-    layers.Input((SEQ_LEN, 2048)),
-    layers.LSTM(128, name="lstm_head"),
-    layers.Dense(512, activation="relu", name="dense_a"),
-    layers.Dropout(0.5),
-    layers.Dense(1, activation="sigmoid", name="dense_out"),
-])
-head.compile(optimizer=keras.optimizers.Adam(1e-4),
-             loss="binary_crossentropy",
-             metrics=["accuracy", keras.metrics.AUC(name="auc")])
-head.summary()
 
-# ---- 5. class weights for the 3.4x imbalance ----
-n_fake = man["counts"]["train_fake"]
-n_real = man["counts"]["train_real"]
-total = n_fake + n_real
-class_weight = {0: total / (2 * n_real), 1: total / (2 * n_fake)}
-print("class_weight:", class_weight)
+train_gen = SeqGen(True, fake=train_fake, real=train_real)
+val_gen   = SeqGen(False, items=[(s, s["label"]) for s in val])
 
-ckpt = keras.callbacks.ModelCheckpoint(
-    "head_best.weights.h5", monitor="val_auc", mode="max",
-    save_best_only=True, save_weights_only=True, verbose=1)
-es = keras.callbacks.EarlyStopping(monitor="val_auc", mode="max",
-                                   patience=8, restore_best_weights=True)
-rlr = keras.callbacks.ReduceLROnPlateau(monitor="val_auc", mode="max",
-                                        factor=0.5, patience=4, verbose=1)
-
-head.fit(SeqGen(train_seqs, True),
-         validation_data=SeqGen(val_seqs, False),
-         epochs=EPOCHS, class_weight=class_weight,
-         callbacks=[ckpt, es, rlr])
-
-# ---- 6. Separation check on validation ----
-print("\n=== VALIDATION SEPARATION CHECK ===")
-vg = SeqGen(val_seqs, False)
-ys, ps = [], []
-for b in range(len(vg)):
-    X, y = vg[b]
-    ps.extend(head.predict(X, verbose=0).ravel())
-    ys.extend(y.ravel())
-ys, ps = np.array(ys), np.array(ps)
-fake_scores, real_scores = ps[ys == 1], ps[ys == 0]
-print(f"FAKE val mean={fake_scores.mean():.3f}  REAL val mean={real_scores.mean():.3f}")
-print(f"Separation={abs(fake_scores.mean()-real_scores.mean()):.3f}  "
-      f"(want a clear gap; >0.2 is good)")
-acc = ((ps > 0.5).astype(int) == ys).mean()
-print(f"Val accuracy @0.5: {acc:.3f}")
-
-# ---- 7. Rebuild the FULL ResNet50+LSTM model and transfer head weights ----
-print("\nRebuilding full ResNet50+LSTM model…")
-frame_in = layers.Input((SEQ_LEN, SIZE, SIZE, 3))
-base = ResNet50(include_top=False, weights="imagenet",
-                pooling="avg", input_shape=(SIZE, SIZE, 3))
+# ── Model ───────────────────────────────────────────────────────────────────
+base = ResNet50(include_top=False, weights="imagenet", pooling="avg",
+                input_shape=(SIZE, SIZE, 3))
 base.trainable = False
-x = layers.TimeDistributed(base)(frame_in)
+inp = layers.Input((SEQ_LEN, SIZE, SIZE, 3))
+x = layers.TimeDistributed(base)(inp)
 x = layers.LSTM(128, name="lstm_head")(x)
 x = layers.Dense(512, activation="relu", name="dense_a")(x)
 x = layers.Dropout(0.5)(x)
 out = layers.Dense(1, activation="sigmoid", name="dense_out")(x)
-full = keras.Model(frame_in, out)
-for name in ["lstm_head", "dense_a", "dense_out"]:
-    full.get_layer(name).set_weights(head.get_layer(name).get_weights())
-full.save(OUT_MODEL)
-print(f"[OK] Saved full model -> {OUT_MODEL}")
-print("Inference must apply resnet50.preprocess_input to frames (as in test_model.py).")
+model = keras.Model(inp, out)
+
+model.compile(optimizer=keras.optimizers.Adam(1e-4),
+              loss="binary_crossentropy",
+              metrics=["accuracy", keras.metrics.AUC(name="auc")])
+
+ckpt = keras.callbacks.ModelCheckpoint(OUT_MODEL, monitor="val_auc", mode="max",
+                                       save_best_only=True, verbose=1)
+es  = keras.callbacks.EarlyStopping(monitor="val_auc", mode="max",
+                                    patience=7, restore_best_weights=True)
+rlr = keras.callbacks.ReduceLROnPlateau(monitor="val_auc", mode="max",
+                                        factor=0.5, patience=3, verbose=1)
+
+print("\n=== Phase 1: train LSTM head (ResNet frozen) ===")
+model.fit(train_gen, validation_data=val_gen, epochs=EPOCHS_HEAD,
+          callbacks=[ckpt, es, rlr])
+
+# ── Phase 2: fine-tune ResNet's top block (conv5) at a low LR ────────────────
+if FINE_TUNE:
+    print("\n=== Phase 2: fine-tune ResNet conv5 block ===")
+    base.trainable = True
+    for l in base.layers:
+        # only conv5_* trainable; keep BatchNorm frozen to preserve running stats
+        l.trainable = l.name.startswith("conv5") and not isinstance(
+            l, keras.layers.BatchNormalization)
+    model.compile(optimizer=keras.optimizers.Adam(1e-5),
+                  loss="binary_crossentropy",
+                  metrics=["accuracy", keras.metrics.AUC(name="auc")])
+    es2 = keras.callbacks.EarlyStopping(monitor="val_auc", mode="max",
+                                        patience=6, restore_best_weights=True)
+    model.fit(train_gen, validation_data=val_gen, epochs=EPOCHS_FINETUNE,
+              callbacks=[ckpt, es2, rlr])
+
+# ── Validation separation check ─────────────────────────────────────────────
+print("\n=== VALIDATION SEPARATION CHECK ===")
+ys, ps = [], []
+for b in range(len(val_gen)):
+    X, y = val_gen[b]
+    ps.extend(model.predict(X, verbose=0).ravel())
+    ys.extend(y.ravel())
+ys, ps = np.array(ys), np.array(ps)
+fake_s, real_s = ps[ys == 1], ps[ys == 0]
+print(f"FAKE mean={fake_s.mean():.3f}  REAL mean={real_s.mean():.3f}")
+print(f"Separation={abs(fake_s.mean()-real_s.mean()):.3f}  (want > 0.3)")
+print(f"Val accuracy @ midpoint: "
+      f"{(((ps > (fake_s.mean()+real_s.mean())/2).astype(int)) == ys).mean():.3f}")
+
+# ── Auto-calibrate decision thresholds from the validation distributions ─────
+F, R = float(fake_s.mean()), float(real_s.mean())
+fs, rs = float(fake_s.std()), float(real_s.std())
+B = (F + R) / 2
+auth_edge, fake_edge = R + rs, F - fs          # 1-std edge of each class
+if fake_edge > auth_edge:                       # clean gap → real uncertain band
+    deepfake_t, authentic_t = fake_edge, auth_edge
+else:                                            # distributions overlap → hard boundary
+    deepfake_t = authentic_t = B
+calib = {
+    "boundary": B,
+    "deepfake_t": deepfake_t,
+    "authentic_t": authentic_t,
+    "half_width": max(0.1, (F - R) / 2),        # maps each class mean to ~100% confidence
+    "stats": {"fake_mean": F, "real_mean": R, "fake_std": fs, "real_std": rs},
+}
+calib_path = os.path.join(os.path.dirname(OUT_MODEL) or ".", "calibration.json")
+json.dump(calib, open(calib_path, "w"), indent=2)
+print("\nAuto-calibration:", json.dumps(calib, indent=2))
+
+model.save(OUT_MODEL)
+print(f"\n[OK] Saved -> {OUT_MODEL}")
+print(f"[OK] Saved -> {calib_path}")
+print("Upload BOTH the .h5 and calibration.json to the Space. Backend already does "
+      "face-crop + preprocess_input to match training.")
