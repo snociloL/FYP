@@ -15,6 +15,9 @@ def main():
     import tensorflow as tf
     print(f"TensorFlow: {tf.__version__}")
 
+
+
+
     # Load from .h5
     print(f"Loading {MODEL_H5} ...")
     model = tf.keras.models.load_model(MODEL_H5)
